@@ -1,22 +1,34 @@
 # ⚡ TechTrack EV Range Prediction
 
-> Predicting electric vehicle driving range from static specifications using machine learning regression.
+> Predicting electric vehicle driving range from static specifications using machine learning regression.  
+> **v2.0 — Industry-Grade:** Nested CV · SHAP · MLflow · FastAPI · Bootstrap CI · Docker · GitHub Actions CI
+
+---
+
+## 🏗️ System Architecture
+
+```mermaid
+graph LR
+    A[ev_dataset.xls] --> B[src/features.py\nFeature Engineering]
+    B --> C[src/train.py\nNested CV + Tuning]
+    C --> D[(model/\nev_range_pipeline.joblib\nbootstrap_models.joblib)]
+    C --> E[(mlruns/\nMLflow Tracking)]
+    C --> F[(reports/figures/\nShap + Residual Plots)]
+    D --> G[app/api.py\nFastAPI :8000]
+    G --> H[app/app.py\nStreamlit UI :8501]
+    G -->|/predict| I[Range + p10-p90 CI]
+    G -->|/explain| J[SHAP Waterfall]
+    K[tests/\nUnit + Smoke Tests] --> G
+    L[.github/workflows/ci.yml\nGitHub Actions] --> K
+```
 
 ---
 
 ## 📌 Project Overview
 
-This project tackles the **TechTrack EV Range Prediction** challenge: given a set of static electric vehicle specifications, predict the vehicle's driving range in kilometres (`range_km`).
-
-The prediction is **specification-based** — it uses only manufacturer-published attributes such as battery capacity, dimensions, motor torque, and charging configuration. It does **not** incorporate real-time telemetry such as traffic, weather, HVAC load, current State of Charge (SoC), or State of Health (SoH).
-
----
-
-## 🎯 Problem Statement
-
 **Task:** Regression — predict `range_km` from available EV specifications.
 
-Given a dataset of EV models characterised by their published hardware and design specifications, the goal is to train a model that generalises well to unseen vehicles and produces accurate range estimates in kilometres.
+The prediction is **specification-based** — uses only manufacturer-published attributes (battery capacity, dimensions, motor torque, charging config). It does **not** incorporate real-time telemetry such as traffic, weather, HVAC load, or battery State of Health.
 
 ---
 
@@ -24,308 +36,264 @@ Given a dataset of EV models characterised by their published hardware and desig
 
 | Property | Value |
 |---|---|
-| Source file | `ev_dataset.xls` |
+| Source file | `notebook/ev_dataset.xls` |
 | Total rows | **478** EV models |
 | Total columns | 22 |
 | Unique brands | **59** |
 | Granularity | One row per EV model |
 | Target variable | `range_km` |
-| Missing target values | 0 |
-
-**Input specifications used by the model (21 features after engineering):**
-
-| Feature | Type | Description |
-|---|---|---|
-| `top_speed_kmh` | Numeric | Maximum speed (km/h) |
-| `battery_capacity_kWh` | Numeric | Usable battery capacity (kWh) |
-| `number_of_cells` | Numeric | Total number of battery cells |
-| `torque_nm` | Numeric | Peak motor torque (Nm) |
-| `acceleration_0_100_s` | Numeric | 0–100 km/h time (seconds) |
-| `fast_charging_power_kw_dc` | Numeric | DC fast-charge power (kW) |
-| `towing_capacity_kg` | Numeric | Maximum towing capacity (kg) |
-| `cargo_volume_l` | Numeric | Cargo/boot volume (litres) |
-| `seats` | Numeric | Seating capacity |
-| `length_mm` | Numeric | Vehicle length (mm) |
-| `width_mm` | Numeric | Vehicle width (mm) |
-| `height_mm` | Numeric | Vehicle height (mm) |
-| `fast_charge_port` | Categorical | DC charging standard (`CCS`, `CHAdeMO`) |
-| `drivetrain` | Categorical | `AWD`, `FWD`, or `RWD` |
-| `segment` | Categorical | EU vehicle segment (e.g. `D - Large`) |
-| `car_body_type` | Categorical | Body style (e.g. `SUV`, `Sedan`) |
-| `footprint_m2` | Engineered | Vehicle ground footprint (m²) |
-| `volume_proxy_m3` | Engineered | Vehicle size proxy (m³) |
-| `battery_per_footprint` | Engineered | Battery capacity relative to footprint |
-| `torque_per_battery` | Engineered | Motor torque relative to battery capacity |
-| `battery_per_volume` | Engineered | Battery capacity relative to volume proxy |
+| Split | 70% train / 15% val / 15% test (seed=42) |
 
 ---
 
-## 🧹 Data Cleaning
+## 🤖 Validation Methodology (v2.0)
 
-The following cleaning steps were performed on the raw dataset:
+### Nested Cross-Validation (Honest Generalization Estimate)
 
-- **Duplicate check** — no duplicate rows were found (0 duplicates).
-- **Cargo volume coercion** — `cargo_volume_l` contained mixed-type entries; non-numeric values were coerced to `NaN` (4 affected rows).
-- **Missing-value audit** — columns with missing values identified:
-
-  | Column | Missing Count |
-  |---|---|
-  | `number_of_cells` | 202 |
-  | `towing_capacity_kg` | 26 |
-  | `torque_nm` | 7 |
-  | `cargo_volume_l` | 4 |
-  | `fast_charging_power_kw_dc` | 1 |
-
-- **No rows dropped** — missing values are handled downstream by the pipeline's imputer steps rather than by row deletion.
-- **Columns excluded from modelling:** `efficiency_wh_per_km`, `brand`, `model`, `source_url`, `battery_type`, and the target `range_km` itself.
-
----
-
-## 📈 Exploratory Data Analysis
-
-EDA performed in the notebook covers:
-
-- **Target distribution** — distribution and summary statistics of `range_km`.
-- **Numerical feature relationships** — scatter plots and correlation analysis between numeric predictors and `range_km`.
-- **Categorical analysis** — value counts and unique-value inspection for `brand`, `model`, `fast_charge_port`, `drivetrain`, `segment`, and `car_body_type` (59 unique brands, 477 unique models).
-- **Missing-value analysis** — bar charts and summary tables for columns with missing data.
-- **Engineered feature relationships** — scatter plots of `battery_per_footprint`, `battery_per_volume`, and `torque_per_battery` against `range_km`.
-- **Correlation heatmap** — Pearson correlation between numeric features and the target.
-
----
-
-## 🧠 Feature Engineering
-
-Five domain-inspired features were derived from the raw specifications:
-
-| Feature | Formula | Rationale |
-|---|---|---|
-| `footprint_m2` | `(length_mm × width_mm) / 1,000,000` | Approximates vehicle ground footprint |
-| `volume_proxy_m3` | `(length_mm × width_mm × height_mm) / 1,000,000,000` | Rough proxy for vehicle size/mass |
-| `battery_per_footprint` | `battery_capacity_kWh / footprint_m2` | Battery density relative to vehicle footprint |
-| `torque_per_battery` | `torque_nm / battery_capacity_kWh` | Motor effort relative to battery capacity |
-| `battery_per_volume` | `battery_capacity_kWh / volume_proxy_m3` | Battery density relative to vehicle volume |
-
-**Ablation study result** (confirmed from notebook output):
-
-| Feature Set | MAE (km) | RMSE (km) | R² |
-|---|---|---|---|
-| Raw Features only | 11.39 | 15.53 | 0.98 |
-| + Engineered Features | 10.54 | 13.67 | 0.98 |
-
-> **Note on `efficiency_wh_per_km`:** This column was explicitly excluded from the predictive model. Because `range_km ≈ battery_capacity_kWh × 1000 / efficiency_wh_per_km`, including it would introduce **target leakage** — the model would be learning a near-perfect algebraic identity rather than genuine predictive relationships.
-
----
-
-## 🤖 Machine Learning Models
-
-### Baseline
-
-A **DummyRegressor** (mean prediction) was used to establish a naive performance floor.
-
-### Linear Model
-
-| Model | Notes |
+| Loop | Role |
 |---|---|
-| Ridge Regression | `alpha=10.0`; serves as an interpretable linear baseline |
+| **Outer: 5-fold CV** | Estimates true generalization error on data unseen during tuning |
+| **Inner: RandomizedSearchCV (30 iter, 5-fold)** | Selects best hyperparameters |
 
-**Ridge test performance:** MAE 17.11 km · RMSE 21.46 km · R² 0.9565
+> ⚠️ The outer-loop score is the **honest** estimate. The inner CV score is optimistic by design and is NOT reported as the model performance.
 
-### Ensemble Comparison — 5-Fold Cross Validation
-
-| Model | CV MAE (km) | CV RMSE (km) | CV R² |
-|---|---|---|---|
-| XGBoost | 13.55 | 18.98 | 0.97 |
-| Extra Trees | 15.37 | 21.41 | 0.96 |
-| Gradient Boosting | 16.62 | 22.14 | 0.95 |
-| Random Forest | 17.12 | 23.59 | 0.95 |
-
-**XGBoost was selected** as the best-performing model based on CV RMSE.
-
-### Hyperparameter Tuning
-
-`RandomizedSearchCV` (30 iterations, 5-fold CV, scoring: RMSE) was applied to XGBoost.
-
-**Best parameters found:**
-
-```
-n_estimators=700, max_depth=3, learning_rate=0.08,
-subsample=0.7, colsample_bytree=0.7, min_child_weight=2
-```
+### Held-Out Test Set
+15% of data is locked away before any training and touched only once for final reporting.
 
 ---
 
-## 📏 Evaluation Metrics
+## 📏 Final Model Performance
 
-| Metric | Description |
+### Outer-Loop (Nested CV) — Honest Generalization
+
+| Metric | Mean ± Std |
 |---|---|
-| **MAE** | Mean Absolute Error — average absolute deviation in km |
-| **RMSE** | Root Mean Squared Error — penalises large errors more heavily |
-| **R²** | Coefficient of determination — proportion of variance explained |
+| MAE | See training output |
+| RMSE | See training output |
+| R² | See training output |
 
-### Final Model Performance on Held-Out Test Set (20%)
+### Held-Out Test Set (15% — never touched during tuning)
 
 | Metric | Value |
 |---|---|
-| **MAE** | **10.54 km** |
-| **RMSE** | **13.67 km** |
-| **R²** | **0.9823** |
+| **MAE** | See training output |
+| **RMSE** | See training output |
+| **R²** | See training output |
 
-*Verified: loaded model from `model/ev_range_pipeline.joblib` reproduces identical RMSE (13.6725).*
-
----
-
-## 🔄 Reproducible Pipeline
-
-The trained preprocessing and model are packaged together in a single **scikit-learn Pipeline** saved via Joblib:
-
-```
-model/ev_range_pipeline.joblib
-```
-
-The pipeline contains:
-- **ColumnTransformer** with:
-  - `numeric` branch: `SimpleImputer` (median) on 17 numeric features
-  - `categorical` branch: `SimpleImputer` (most frequent) → `OneHotEncoder` on 4 categorical features
-- **XGBRegressor** with tuned hyperparameters
-
-Loading and predicting:
-
-```python
-import joblib
-import pandas as pd
-
-model = joblib.load("model/ev_range_pipeline.joblib")
-prediction = model.predict(input_df)  # input_df must include all 21 features
-```
+> Run `make train` to regenerate all metrics.
 
 ---
 
-## 🖥️ Interactive Demo
+## 🔬 Feature Engineering
 
-A **Streamlit** application (`app/app.py`) is planned as part of this project. When complete, it will allow users to enter EV specifications and receive a predicted driving range instantly.
+Five domain-inspired engineered features:
 
-> `app/app.py` is a target deliverable. `streamlit` is included in `requirements.txt`.
+| Feature | Formula |
+|---|---|
+| `footprint_m2` | `(length_mm × width_mm) / 1,000,000` |
+| `volume_proxy_m3` | `(length_mm × width_mm × height_mm) / 1,000,000,000` |
+| `battery_per_footprint` | `battery_capacity_kWh / footprint_m2` |
+| `torque_per_battery` | `torque_nm / battery_capacity_kWh` |
+| `battery_per_volume` | `battery_capacity_kWh / volume_proxy_m3` |
 
-To run the application once available:
+> `efficiency_wh_per_km` excluded — target leakage: `range_km ≈ battery_capacity_kWh × 1000 / efficiency_wh_per_km`
 
-```bash
-streamlit run app/app.py
-```
+---
+
+## 🔍 SHAP Interpretability
+
+SHAP analysis is run automatically during training and saved to `reports/figures/`:
+
+| Plot | File |
+|---|---|
+| Global beeswarm | `shap_summary_beeswarm.png` |
+| Global bar (mean \|SHAP\|) | `shap_global_bar.png` |
+| Dependence plots (top 5) | `shap_dependence_<feature>.png` |
+| Waterfall — short range | `shap_waterfall_short.png` |
+| Waterfall — medium range | `shap_waterfall_medium.png` |
+| Waterfall — long range | `shap_waterfall_long.png` |
 
 ---
 
 ## 📁 Project Structure
 
 ```
-TechTrack_EV_Range/
-├── notebook/
-│   └── EV_Range_Prediction.ipynb   # Full ML workflow
-├── model/
-│   └── ev_range_pipeline.joblib    # Trained pipeline (preprocessing + XGBoost)
+EV_range_prediction/
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # GitHub Actions CI (tests + lint on push/PR)
 ├── app/
-│   └── app.py                      # Streamlit interactive demo (planned)
+│   ├── api.py                  # FastAPI service (/predict, /explain, /health)
+│   ├── app.py                  # Streamlit UI (calls FastAPI)
+│   └── schemas.py              # Pydantic request/response models
+├── model/
+│   ├── ev_range_pipeline.joblib    # Final trained pipeline
+│   └── bootstrap_models.joblib    # 500 bootstrap models for CI
+├── notebook/
+│   ├── EV_Range_Prediction.ipynb
+│   └── ev_dataset.xls
+├── reports/
+│   └── figures/                # Auto-generated plots (gitignored)
+├── src/
+│   ├── features.py             # Pure feature engineering functions (tested)
+│   ├── train.py                # Full training script (nested CV + SHAP + MLflow)
+│   └── bootstrap.py            # Bootstrap CI module
+├── tests/
+│   ├── test_features.py        # Unit tests — all features.py functions
+│   └── test_smoke.py           # Smoke tests — pipeline loading + sanity checks
 ├── report/
-│   └── technical_report.pdf        # Technical report
-├── requirements.txt                # Python dependencies
-└── README.md
+│   └── technical_report.pdf
+├── Dockerfile
+├── docker-compose.yml
+├── Makefile
+├── MODEL_CARD.md
+├── README.md
+└── requirements.txt            # Exact pinned versions
 ```
 
 ---
 
-## ⚙️ Installation
+## ⚙️ Quick Start
+
+### 1. Setup environment
 
 ```bash
-# 1. Clone the repository
-git clone <repository-url>
-cd TechTrack_EV_Range
-
-# 2. Create a virtual environment
-python -m venv .venv
-
-# 3. Activate the environment
-# macOS / Linux:
-source .venv/bin/activate
-# Windows:
-.venv\Scripts\activate
-
-# 4. Install dependencies
-pip install -r requirements.txt
+git clone https://github.com/Devcoderakash/EV_range_prediction_model.git
+cd EV_range_prediction_model
+make setup       # Creates .venv and installs all pinned dependencies
 ```
 
----
-
-## ▶️ Run the Application
+### 2. Train the model (end-to-end)
 
 ```bash
-streamlit run app/app.py
+make train
+# Runs: data loading → feature engineering → nested CV → tuning →
+#        residual analysis → SHAP → MLflow logging → bootstrap CI training
+# Outputs: model/ev_range_pipeline.joblib, model/bootstrap_models.joblib,
+#           reports/figures/*.png, mlruns/
 ```
 
----
-
-## 📓 Run the Notebook
+### 3. Start the API
 
 ```bash
-jupyter notebook notebook/EV_Range_Prediction.ipynb
+make api         # FastAPI on http://localhost:8000
+# Docs: http://localhost:8000/docs
 ```
 
-Run all cells top-to-bottom. The notebook covers:
+### 4. Start the Streamlit UI
 
-1. Data loading and cleaning
-2. Exploratory data analysis
-3. Feature engineering
-4. Train/test split (80/20)
-5. Preprocessing pipeline construction
-6. Baseline and linear modelling
-7. Ensemble model cross-validation comparison
-8. XGBoost hyperparameter tuning (RandomizedSearchCV)
-9. Final model evaluation on held-out test set
-10. Feature importance analysis
-11. Model serialisation and verification
+```bash
+make ui          # Streamlit on http://localhost:8501
+# (requires API to be running on :8000)
+```
+
+### 5. Run tests
+
+```bash
+make test        # pytest unit + smoke tests
+```
+
+### 6. Explore MLflow runs
+
+```bash
+make mlflow      # MLflow UI on http://localhost:5000
+```
+
+### 7. Docker (run everything)
+
+```bash
+make docker      # docker compose up --build (API :8000, UI :8501)
+```
 
 ---
 
-## 📄 Technical Report
+## 🌐 API Reference
 
-```
-report/technical_report.pdf
+### `POST /predict`
+
+Returns predicted range + p10–p90 bootstrap confidence interval.
+
+**Request body** (21 EV spec fields):
+```json
+{
+  "top_speed_kmh": 180,
+  "battery_capacity_kWh": 77.4,
+  "torque_nm": 350.0,
+  "acceleration_0_100_s": 7.4,
+  "fast_charging_power_kw_dc": 100.0,
+  "seats": 5,
+  "length_mm": 4180, "width_mm": 1800, "height_mm": 1445,
+  "fast_charge_port": "CCS",
+  "drivetrain": "RWD",
+  "segment": "D - Large",
+  "car_body_type": "Hatchback",
+  ...
+}
 ```
 
-The technical report is included in the `report/` directory.
+**Response:**
+```json
+{
+  "prediction": 387.2,
+  "p_lower": 361.0,
+  "p_upper": 415.4,
+  "interval_pct": "p10–p90",
+  "units": "km"
+}
+```
+
+### `POST /explain`
+Returns SHAP values for the given input (used by Streamlit for waterfall plot).
+
+### `GET /health`
+Returns API and model load status.
+
+---
+
+## 🔄 Confidence Intervals (Bootstrap p10–p90)
+
+500 XGBoost models are trained on bootstrap resamples of the training set. For each new prediction, all 500 models predict, and p10/p90 are taken as the interval bounds.
+
+> These intervals capture **model uncertainty** (variance due to finite training data), not aleatoric uncertainty (real-world driving variation). True real-world uncertainty is substantially wider.
 
 ---
 
 ## ⚠️ Limitations
 
-- **Static specifications only** — real-world range is influenced by factors not captured in manufacturer specs, including:
-  - Driving style and speed profile
-  - Ambient temperature and weather conditions
-  - HVAC (heating/cooling) load
-  - Terrain and elevation changes
-  - Battery degradation (State of Health)
-  - Traffic conditions and stop-start driving
-- **Manufacturer data accuracy** — the model inherits any inaccuracies in source specification data.
-- **Extrapolation risk** — predictions for EVs outside the training distribution may be unreliable.
-- **No real-time adaptation** — the model does not update based on live vehicle data or telematics.
+See [`MODEL_CARD.md`](MODEL_CARD.md) for the full detailed breakdown.
+
+**Key limitations:**
+- Static specs only — driving style, temperature, terrain, HVAC, and battery degradation not modeled
+- Manufacturer-rated range figures (WLTP) overestimate real-world range by 10–20%
+- Sparse brands (< 5 examples) have unreliable predictions
+- Extrapolation risk for EVs outside training distribution
+
+---
+
+## 🧪 Testing & CI
+
+| Test file | Coverage |
+|---|---|
+| `tests/test_features.py` | 34 unit tests — every function in `src/features.py` |
+| `tests/test_smoke.py` | 9 smoke tests — pipeline loading, sanity, monotonicity |
+
+GitHub Actions CI (`.github/workflows/ci.yml`) runs all tests + flake8 lint on every push and PR.
 
 ---
 
 ## 🚀 Future Improvements
 
-The following are suggestions for **future work** and do not reflect existing functionality:
-
-- Build and deploy `app/app.py` as an interactive Streamlit range predictor
-- Integrate real-world owner-reported range data to complement manufacturer figures
-- Add SHAP explainability to the app
-- Explore range-by-temperature modelling using climate data
-- Add confidence intervals via quantile regression or conformal prediction
+- Integrate real-world owner-reported range data
+- Add temperature-adjusted predictions using climate data
+- Formal quantile regression for more calibrated intervals
 - Periodic retraining as new EV models enter the market
+- Conformal prediction for coverage-guaranteed intervals
 
 ---
 
 ## 👨‍💻 Project
 
-**TechTrack EV Range Prediction**  
+**TechTrack EV Range Prediction v2.0**  
 Built as part of the TechTrack machine learning challenge.
 
-> Model: XGBoost Regressor · Framework: scikit-learn Pipeline · Language: Python 3
+> Model: XGBoost Regressor · Framework: scikit-learn Pipeline · API: FastAPI · UI: Streamlit · Tracking: MLflow · Language: Python 3

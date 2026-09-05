@@ -14,6 +14,18 @@ __pycache__/
 # Jupyter checkpoints
 .ipynb_checkpoints/
 
-# Model artifacts (optional - remove if you want to track these)
-# *.joblib
-# *.pkl
+# MLflow runs (local tracking)
+mlruns/
+
+# Generated figures (large binary files)
+reports/figures/*.png
+reports/figures/*.pdf
+
+# Bootstrap models (large — regenerate with make train)
+model/bootstrap_models.joblib
+
+# Test / build cache
+.pytest_cache/
+.mypy_cache/
+dist/
+build/

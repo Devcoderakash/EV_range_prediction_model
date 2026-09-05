@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Tests & Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run feature unit tests
+        run: pytest tests/test_features.py -v --tb=short
+
+      - name: Run pipeline smoke tests
+        run: pytest tests/test_smoke.py -v --tb=short
+        # Smoke tests skip automatically if model/ev_range_pipeline.joblib is missing.
+        # To run smoke tests in CI, commit the model file or download it as an artifact.
+
+      - name: Lint with flake8
+        run: |
+          pip install flake8
+          flake8 src/ app/ tests/ \
+            --max-line-length=100 \
+            --extend-ignore=E203,W503,E501 \
+            --exclude=.venv,__pycache__
