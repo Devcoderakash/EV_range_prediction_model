@@ -7,6 +7,7 @@ independently unit-tested with fixed inputs/outputs.
 """
 
 import pandas as pd
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -30,9 +31,14 @@ NUMERIC_FEATURES = [
     "battery_per_footprint",
     "torque_per_battery",
     "battery_per_volume",
+    "battery_per_frontal_area",
+    "log_battery_capacity",
+    "log_torque",
+    "log_cargo_volume",
 ]
 
 CATEGORICAL_FEATURES = [
+    "brand",
     "fast_charge_port",
     "drivetrain",
     "segment",
@@ -46,7 +52,6 @@ TARGET = "range_km"
 # Columns to drop before modelling (leakage or non-informative)
 DROP_COLS = [
     "efficiency_wh_per_km",  # target leakage: range ≈ battery/efficiency
-    "brand",
     "model",
     "source_url",
     "battery_type",
@@ -63,6 +68,14 @@ SPARSE_BRAND_THRESHOLD = 5
 # ---------------------------------------------------------------------------
 # Individual engineered-feature functions (each testable in isolation)
 # ---------------------------------------------------------------------------
+
+def extract_base_model(name) -> str:
+    """Extract base model from full trim name (e.g., 'Abarth 500e Convertible' -> 'Abarth 500e')."""
+    name = str(name)
+    words = name.split()
+    if len(words) >= 2:
+        return ' '.join(words[:2])
+    return name
 
 def compute_footprint_m2(length_mm: pd.Series, width_mm: pd.Series) -> pd.Series:
     """Ground footprint of the vehicle in m²."""
@@ -95,6 +108,14 @@ def compute_battery_per_volume(
 ) -> pd.Series:
     """Battery energy density relative to vehicle volume (kWh / m³)."""
     return battery_capacity_kWh / volume_proxy_m3
+
+
+def compute_battery_per_frontal_area(
+    battery_capacity_kWh: pd.Series, width_mm: pd.Series, height_mm: pd.Series
+) -> pd.Series:
+    """Battery capacity relative to frontal area proxy (kWh / m²)."""
+    frontal_area = (width_mm * height_mm) / 1_000_000
+    return battery_capacity_kWh / frontal_area
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +156,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     # Coerce mixed-type cargo volume
     out["cargo_volume_l"] = coerce_cargo_volume(out["cargo_volume_l"])
 
+    # Extract base model for group-based cross validation
+    if "model" in out.columns:
+        out["base_model"] = out["model"].apply(extract_base_model)
+
     # Derived features
     out["footprint_m2"] = compute_footprint_m2(out["length_mm"], out["width_mm"])
     out["volume_proxy_m3"] = compute_volume_proxy_m3(
@@ -149,6 +174,14 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     out["battery_per_volume"] = compute_battery_per_volume(
         out["battery_capacity_kWh"], out["volume_proxy_m3"]
     )
+    out["battery_per_frontal_area"] = compute_battery_per_frontal_area(
+        out["battery_capacity_kWh"], out["width_mm"], out["height_mm"]
+    )
+    
+    # Log transformations for highly skewed continuous variables
+    out["log_battery_capacity"] = np.log1p(out["battery_capacity_kWh"].fillna(0))
+    out["log_torque"] = np.log1p(out["torque_nm"].fillna(0))
+    out["log_cargo_volume"] = np.log1p(out["cargo_volume_l"].fillna(0))
 
     return out
 

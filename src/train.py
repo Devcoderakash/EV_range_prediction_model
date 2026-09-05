@@ -39,19 +39,22 @@ import mlflow
 import mlflow.sklearn
 
 from sklearn.pipeline import Pipeline
-from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
+from sklearn.preprocessing import OneHotEncoder, TargetEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.ensemble import (
     RandomForestRegressor,
     GradientBoostingRegressor,
     ExtraTreesRegressor,
+    StackingRegressor,
 )
 from sklearn.dummy import DummyRegressor
 from sklearn.model_selection import (
     train_test_split,
     KFold,
+    GroupKFold,
+    GroupShuffleSplit,
     RandomizedSearchCV,
     cross_validate,
 )
@@ -89,7 +92,7 @@ PIPELINE_PATH = MODEL_DIR / "ev_range_pipeline.joblib"
 BOOTSTRAP_PATH = MODEL_DIR / "bootstrap_models.joblib"
 
 N_OUTER_FOLDS = 5
-N_INNER_ITER = 30
+N_INNER_ITER = 75
 N_BOOTSTRAP = 500   # bootstrap resamples for CI; keep reasonable for speed
 BOOTSTRAP_ALPHA = 0.1  # p10–p90 interval
 
@@ -110,7 +113,7 @@ def make_preprocessor() -> ColumnTransformer:
     ])
     categorical_pipe = Pipeline([
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+        ("target_enc", TargetEncoder(target_type="continuous", smooth="auto")),
     ])
     return ColumnTransformer([
         ("numeric", numeric_pipe, NUMERIC_FEATURES),
@@ -119,14 +122,38 @@ def make_preprocessor() -> ColumnTransformer:
 
 
 def make_xgb_pipeline(**xgb_kwargs) -> Pipeline:
+    xgb = XGBRegressor(
+        objective="reg:squarederror",
+        random_state=RANDOM_SEED,
+        n_jobs=-1,
+        **xgb_kwargs,
+    )
+    # Predict log(range) to better handle scale and ensure positive predictions
+    tt_reg = TransformedTargetRegressor(regressor=xgb, func=np.log1p, inverse_func=np.expm1)
+    
     return Pipeline([
         ("preprocessor", make_preprocessor()),
-        ("model", XGBRegressor(
-            objective="reg:squarederror",
-            random_state=RANDOM_SEED,
-            n_jobs=-1,
-            **xgb_kwargs,
-        )),
+        ("model", tt_reg),
+    ])
+
+
+def make_stacked_pipeline(**xgb_kwargs) -> Pipeline:
+    estimators = [
+        ("xgb", XGBRegressor(objective="reg:squarederror", random_state=RANDOM_SEED, n_jobs=-1, **xgb_kwargs)),
+        ("et", ExtraTreesRegressor(n_estimators=300, random_state=RANDOM_SEED, n_jobs=-1)),
+        ("gb", GradientBoostingRegressor(n_estimators=300, random_state=RANDOM_SEED))
+    ]
+    stack = StackingRegressor(
+        estimators=estimators,
+        final_estimator=Ridge(alpha=1.0),
+        n_jobs=-1,
+        passthrough=False
+    )
+    tt_reg = TransformedTargetRegressor(regressor=stack, func=np.log1p, inverse_func=np.expm1)
+    
+    return Pipeline([
+        ("preprocessor", make_preprocessor()),
+        ("model", tt_reg),
     ])
 
 
@@ -166,14 +193,26 @@ def load_and_split():
     else:
         log.info("  No sparse brands found.")
 
+    base_model_series = df["base_model"].reset_index(drop=True)
+
     # 70 / 15 / 15 split — test set is locked away until final evaluation
-    X_trainval, X_test, y_trainval, y_test, brand_tv, brand_test = train_test_split(
-        X, y, brand_series, test_size=0.15, random_state=RANDOM_SEED
-    )
-    X_train, X_val, y_train, y_val, brand_train, brand_val = train_test_split(
-        X_trainval, y_trainval, brand_tv, test_size=0.1765,  # 0.15 / 0.85 ≈ 17.65%
-        random_state=RANDOM_SEED
-    )
+    gss1 = GroupShuffleSplit(n_splits=1, test_size=0.15, random_state=RANDOM_SEED)
+    trainval_idx, test_idx = next(gss1.split(X, y, groups=base_model_series))
+    
+    X_trainval, X_test = X.iloc[trainval_idx], X.iloc[test_idx]
+    y_trainval, y_test = y.iloc[trainval_idx], y.iloc[test_idx]
+    brand_tv, brand_test = brand_series.iloc[trainval_idx], brand_series.iloc[test_idx]
+    base_tv = base_model_series.iloc[trainval_idx]
+
+    # Split trainval into train (70%) and val (15%) -> test_size = 0.15/0.85 = 0.1765
+    gss2 = GroupShuffleSplit(n_splits=1, test_size=0.1765, random_state=RANDOM_SEED)
+    train_idx, val_idx = next(gss2.split(X_trainval, y_trainval, groups=base_tv))
+
+    X_train, X_val = X_trainval.iloc[train_idx], X_trainval.iloc[val_idx]
+    y_train, y_val = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
+    brand_train, brand_val = brand_tv.iloc[train_idx], brand_tv.iloc[val_idx]
+    base_train, base_val = base_tv.iloc[train_idx], base_tv.iloc[val_idx]
+
     log.info(
         f"\n  Split sizes → train: {len(X_train)}, val: {len(X_val)}, test: {len(X_test)}"
     )
@@ -182,6 +221,7 @@ def load_and_split():
         y_train, y_val, y_test,
         X_trainval, y_trainval,
         brand_train, brand_val, brand_test,
+        base_tv,  # Return groups for nested CV
         raw,
     )
 
@@ -255,30 +295,31 @@ def compare_models_mlflow(X_train, y_train, X_val, y_val):
 # Step 1: Nested cross-validation (honest outer-loop estimate)
 # ---------------------------------------------------------------------------
 
-def nested_cv(X_trainval, y_trainval):
+def nested_cv(X_trainval, y_trainval, groups_trainval):
     log.info("\n─── Nested Cross-Validation ────────────────────────────────────")
 
     param_dist = {
-        "model__n_estimators":   [300, 500, 700, 900],
-        "model__max_depth":      [3, 4, 5, 6],
-        "model__learning_rate":  [0.03, 0.05, 0.08, 0.1],
-        "model__subsample":      [0.6, 0.7, 0.8, 1.0],
-        "model__colsample_bytree": [0.6, 0.7, 0.8, 1.0],
-        "model__min_child_weight": [1, 2, 5, 10],
+        "model__regressor__xgb__n_estimators":   [300, 500, 700, 900],
+        "model__regressor__xgb__max_depth":      [3, 4, 5, 6],
+        "model__regressor__xgb__learning_rate":  [0.01, 0.03, 0.05, 0.08, 0.1],
+        "model__regressor__xgb__subsample":      [0.6, 0.7, 0.8, 1.0],
+        "model__regressor__xgb__colsample_bytree": [0.6, 0.7, 0.8, 1.0],
+        "model__regressor__xgb__min_child_weight": [1, 2, 5, 10],
     }
 
-    outer_cv = KFold(n_splits=N_OUTER_FOLDS, shuffle=True, random_state=RANDOM_SEED)
-    inner_cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+    outer_cv = GroupKFold(n_splits=N_OUTER_FOLDS)
+    inner_cv = GroupKFold(n_splits=5)
 
     outer_mae, outer_rmse, outer_r2 = [], [], []
     best_params_per_fold = []
 
-    for fold, (train_idx, val_idx) in enumerate(outer_cv.split(X_trainval, y_trainval), 1):
+    for fold, (train_idx, val_idx) in enumerate(outer_cv.split(X_trainval, y_trainval, groups=groups_trainval), 1):
         X_tr, X_vl = X_trainval.iloc[train_idx], X_trainval.iloc[val_idx]
         y_tr, y_vl = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
+        groups_tr = groups_trainval.iloc[train_idx]
 
         inner_search = RandomizedSearchCV(
-            make_xgb_pipeline(),
+            make_stacked_pipeline(),
             param_distributions=param_dist,
             n_iter=N_INNER_ITER,
             cv=inner_cv,
@@ -287,7 +328,7 @@ def nested_cv(X_trainval, y_trainval):
             random_state=RANDOM_SEED,
             refit=True,
         )
-        inner_search.fit(X_tr, y_tr)
+        inner_search.fit(X_tr, y_tr, groups=groups_tr)
         best_params_per_fold.append(inner_search.best_params_)
 
         y_pred_vl = inner_search.predict(X_vl)
@@ -318,21 +359,21 @@ def nested_cv(X_trainval, y_trainval):
 # Step 1: Train final model on full trainval set
 # ---------------------------------------------------------------------------
 
-def train_final_model(X_trainval, y_trainval):
+def train_final_model(X_trainval, y_trainval, groups_trainval):
     log.info("\n─── Training final model (full trainval set) ──────────────────")
 
     param_dist = {
-        "model__n_estimators":     [300, 500, 700, 900],
-        "model__max_depth":        [3, 4, 5, 6],
-        "model__learning_rate":    [0.03, 0.05, 0.08, 0.1],
-        "model__subsample":        [0.6, 0.7, 0.8, 1.0],
-        "model__colsample_bytree": [0.6, 0.7, 0.8, 1.0],
-        "model__min_child_weight": [1, 2, 5, 10],
+        "model__regressor__xgb__n_estimators":     [300, 500, 700, 900],
+        "model__regressor__xgb__max_depth":        [3, 4, 5, 6],
+        "model__regressor__xgb__learning_rate":    [0.01, 0.03, 0.05, 0.08, 0.1],
+        "model__regressor__xgb__subsample":        [0.6, 0.7, 0.8, 1.0],
+        "model__regressor__xgb__colsample_bytree": [0.6, 0.7, 0.8, 1.0],
+        "model__regressor__xgb__min_child_weight": [1, 2, 5, 10],
     }
-    inner_cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_SEED)
+    inner_cv = GroupKFold(n_splits=5)
 
     search = RandomizedSearchCV(
-        make_xgb_pipeline(),
+        make_stacked_pipeline(),
         param_distributions=param_dist,
         n_iter=N_INNER_ITER,
         cv=inner_cv,
@@ -341,7 +382,7 @@ def train_final_model(X_trainval, y_trainval):
         random_state=RANDOM_SEED,
         refit=True,
     )
-    search.fit(X_trainval, y_trainval)
+    search.fit(X_trainval, y_trainval, groups=groups_trainval)
     best = search.best_estimator_
     log.info(f"  Best params: {search.best_params_}")
     return best
@@ -555,7 +596,7 @@ def shap_analysis(pipeline, X_train, X_test, outer_results, artifact_paths: list
 def train_bootstrap_models(X_trainval, y_trainval, best_params: dict):
     log.info(f"\n─── Bootstrap CI Training ({N_BOOTSTRAP} resamples) ──────────────────")
 
-    clean_params = {k.replace("model__", ""): v for k, v in best_params.items()}
+    clean_params = {k.replace("model__regressor__xgb__", ""): v for k, v in best_params.items()}
     bootstrap_models = []
 
     for i in range(N_BOOTSTRAP):
@@ -564,7 +605,7 @@ def train_bootstrap_models(X_trainval, y_trainval, best_params: dict):
         X_b = X_trainval.iloc[idx]
         y_b = y_trainval.iloc[idx]
 
-        pipe = make_xgb_pipeline(**clean_params)
+        pipe = make_stacked_pipeline(**clean_params)
         pipe.fit(X_b, y_b)
         bootstrap_models.append(pipe)
 
@@ -593,17 +634,33 @@ def main():
         y_train, y_val, y_test,
         X_trainval, y_trainval,
         brand_train, brand_val, brand_test,
+        base_tv,
         raw,
     ) = load_and_split()
+
+    # ── 0. Data Quality: Remove extreme outliers from trainval ────────────────
+    log.info("\n─── Dropping Outliers (Train/Val only) ──────────────────────────")
+    imp = SimpleImputer(strategy="median")
+    X_tv_num = imp.fit_transform(X_trainval.select_dtypes(include=[np.number]))
+    r = Ridge().fit(X_tv_num, y_trainval)
+    resid = np.abs(y_trainval - r.predict(X_tv_num))
+    
+    valid_idx = resid <= 100
+    n_dropped = (~valid_idx).sum()
+    log.info(f"  Dropped {n_dropped} outliers (>100km error) from trainval set.")
+    
+    X_trainval = X_trainval[valid_idx]
+    y_trainval = y_trainval[valid_idx]
+    base_tv = base_tv[valid_idx]
 
     # ── 3. MLflow model comparison ─────────────────────────────────────────
     compare_models_mlflow(X_train, y_train, X_val, y_val)
 
     # ── 1. Nested CV (honest outer-loop estimate) ──────────────────────────
-    outer_results = nested_cv(X_trainval, y_trainval)
+    outer_results = nested_cv(X_trainval, y_trainval, groups_trainval=base_tv)
 
     # ── 1+7. Train final model ─────────────────────────────────────────────
-    final_pipeline = train_final_model(X_trainval, y_trainval)
+    final_pipeline = train_final_model(X_trainval, y_trainval, groups_trainval=base_tv)
 
     # Save final pipeline
     joblib.dump(final_pipeline, PIPELINE_PATH)
@@ -613,16 +670,16 @@ def main():
     test_metrics = compute_metrics(y_test, final_pipeline.predict(X_test))
     best_params = dict(zip(
         [
-            "model__n_estimators", "model__max_depth", "model__learning_rate",
-            "model__subsample", "model__colsample_bytree", "model__min_child_weight",
+            "model__regressor__xgb__n_estimators", "model__regressor__xgb__max_depth", "model__regressor__xgb__learning_rate",
+            "model__regressor__xgb__subsample", "model__regressor__xgb__colsample_bytree", "model__regressor__xgb__min_child_weight",
         ],
         [
-            final_pipeline.named_steps["model"].n_estimators,
-            final_pipeline.named_steps["model"].max_depth,
-            final_pipeline.named_steps["model"].learning_rate,
-            final_pipeline.named_steps["model"].subsample,
-            final_pipeline.named_steps["model"].colsample_bytree,
-            final_pipeline.named_steps["model"].min_child_weight,
+            final_pipeline.named_steps["model"].regressor_.named_estimators_["xgb"].n_estimators,
+            final_pipeline.named_steps["model"].regressor_.named_estimators_["xgb"].max_depth,
+            final_pipeline.named_steps["model"].regressor_.named_estimators_["xgb"].learning_rate,
+            final_pipeline.named_steps["model"].regressor_.named_estimators_["xgb"].subsample,
+            final_pipeline.named_steps["model"].regressor_.named_estimators_["xgb"].colsample_bytree,
+            final_pipeline.named_steps["model"].regressor_.named_estimators_["xgb"].min_child_weight,
         ],
     ))
 
@@ -642,6 +699,8 @@ def main():
                 "numpy.dtype",
                 "xgboost.core.Booster",
                 "xgboost.sklearn.XGBRegressor",
+                "sklearn.ensemble._stacking.StackingRegressor",
+                "sklearn.utils._bunch.Bunch",
             ],
         )
         mlflow.log_artifact(str(PIPELINE_PATH))
