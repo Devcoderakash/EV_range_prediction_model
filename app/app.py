@@ -16,7 +16,10 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import matplotlib
-matplotlib.use("Agg")
+try:
+    matplotlib.use("Agg")  # headless backend — ignored if Streamlit sets its own
+except Exception:
+    pass
 import matplotlib.pyplot as plt
 
 API_URL = "http://localhost:8000"
@@ -105,30 +108,24 @@ st.caption(
 )
 
 if predict_btn:
-    # Build request payload
-    footprint = (length * width) / 1_000_000
-    vol_proxy = (length * width * height) / 1_000_000_000
-    batt_fp = battery / footprint if footprint > 0 else 0
-    torque_b = torque / battery if battery > 0 else 0
-    batt_vol = battery / vol_proxy if vol_proxy > 0 else 0
 
     payload = {
-        "top_speed_kmh":             top_speed,
-        "battery_capacity_kWh":      battery,
-        "number_of_cells":           float(cells) if cells > 0 else None,
-        "torque_nm":                 float(torque),
-        "acceleration_0_100_s":      accel,
+        "top_speed_kmh": top_speed,
+        "battery_capacity_kWh": battery,
+        "number_of_cells": float(cells) if cells > 0 else None,
+        "torque_nm": float(torque),
+        "acceleration_0_100_s": accel,
         "fast_charging_power_kw_dc": float(fast_charge_kw),
-        "towing_capacity_kg":        float(towing),
-        "cargo_volume_l":            float(cargo),
-        "seats":                     seats,
-        "length_mm":                 length,
-        "width_mm":                  width,
-        "height_mm":                 height,
-        "fast_charge_port":          fast_charge_port,
-        "drivetrain":                drivetrain,
-        "segment":                   segment,
-        "car_body_type":             body_type,
+        "towing_capacity_kg": float(towing),
+        "cargo_volume_l": float(cargo),
+        "seats": seats,
+        "length_mm": length,
+        "width_mm": width,
+        "height_mm": height,
+        "fast_charge_port": fast_charge_port,
+        "drivetrain": drivetrain,
+        "segment": segment,
+        "car_body_type": body_type,
     }
 
     col1, col2 = st.columns([1, 2])
@@ -226,7 +223,7 @@ if predict_btn:
             ax2.set_facecolor("#0d1b2a")
 
             y_pos = np.arange(len(top_feats))
-            bars = ax2.barh(y_pos, top_shap, color=colors, edgecolor="none", height=0.65)
+            ax2.barh(y_pos, top_shap, color=colors, edgecolor="none", height=0.65)
             ax2.set_yticks(y_pos)
             ax2.set_yticklabels(top_feats, fontsize=9, color="#E0E0E0")
             ax2.invert_yaxis()
@@ -281,7 +278,7 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
     try:
-        health = requests.get(f"{API_URL}/health", timeout=3).json()
+        requests.get(f"{API_URL}/health", timeout=3).raise_for_status()
         st.success("✅ API connected")
     except Exception:
         st.error("❌ API offline — run `make api`")
