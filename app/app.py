@@ -11,16 +11,16 @@ Run with:
 (The FastAPI service must be running on port 8000 first)
 """
 
-import requests
-import pandas as pd
-import numpy as np
-import streamlit as st
 import matplotlib
 try:
     matplotlib.use("Agg")  # headless backend — ignored if Streamlit sets its own
 except Exception:
     pass
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import requests
+import streamlit as st
 
 API_URL = "http://localhost:8000"
 
