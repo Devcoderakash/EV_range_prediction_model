@@ -101,15 +101,22 @@ async def lifespan(app: FastAPI):
     else:
         log.warning(f"  Bootstrap models not found at {BOOTSTRAP_PATH} — intervals unavailable")
 
-    # Build SHAP explainer once
+    # Build SHAP explainer (using XGBoost base estimator for approximation)
     pipeline = _state["pipeline"]
     preprocessor = pipeline.named_steps["preprocessor"]
-    xgb_model = pipeline.named_steps["model"]
-    ohe = preprocessor.named_transformers_["categorical"].named_steps["onehot"]
-    cat_names = ohe.get_feature_names_out(CATEGORICAL_FEATURES).tolist()
-    _state["feature_names"] = NUMERIC_FEATURES + cat_names
-    _state["explainer"] = shap.TreeExplainer(xgb_model)
-    log.info("  SHAP TreeExplainer ready")
+    
+    # TargetEncoder keeps the same column names, no expansion like OneHotEncoder
+    _state["feature_names"] = NUMERIC_FEATURES + CATEGORICAL_FEATURES
+    
+    try:
+        tt_reg = pipeline.named_steps["model"]
+        stack = tt_reg.regressor_
+        xgb_model = stack.named_estimators_["xgb"]
+        _state["explainer"] = shap.TreeExplainer(xgb_model)
+        log.info("  SHAP TreeExplainer ready (using XGBoost base model)")
+    except Exception as e:
+        log.warning(f"  Could not initialize SHAP explainer: {e}")
+        _state["explainer"] = None
 
     yield
 
