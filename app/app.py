@@ -20,6 +20,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+# pyrefly: ignore [missing-import]
 import streamlit as st
 
 API_URL = "http://localhost:8000"

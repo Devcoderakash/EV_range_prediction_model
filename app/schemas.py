@@ -5,6 +5,7 @@ Pydantic models for FastAPI request / response validation.
 
 from typing import Literal
 
+# pyrefly: ignore [missing-import]
 from pydantic import BaseModel, Field
 
 
