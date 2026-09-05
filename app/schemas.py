@@ -3,8 +3,9 @@
 Pydantic models for FastAPI request / response validation.
 """
 
-from pydantic import BaseModel, Field
 from typing import Literal
+
+from pydantic import BaseModel, Field
 
 
 class EVInput(BaseModel):
