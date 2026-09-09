@@ -20,10 +20,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+import os
 # pyrefly: ignore [missing-import]
 import streamlit as st
 
-API_URL = "http://localhost:8000"
+API_URL = os.environ.get("API_URL", "http://localhost:8000")
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
