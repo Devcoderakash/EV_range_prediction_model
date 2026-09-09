@@ -19,9 +19,13 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 import pandas as pd
+# pyrefly: ignore [missing-import]
 import joblib
+# pyrefly: ignore [missing-import]
 import shap
+# pyrefly: ignore [missing-import]
 from fastapi import FastAPI, HTTPException
+# pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,43 +52,17 @@ _state: dict = {
 def _input_to_df(ev: EVInput) -> pd.DataFrame:
     """Convert an EVInput Pydantic model into a single-row feature DataFrame."""
     d = ev.model_dump()
-
-    # Derive engineered features from raw dimensions
-    length = float(d["length_mm"])
-    width = float(d["width_mm"])
-    height = float(d["height_mm"])
-    batt = float(d["battery_capacity_kWh"])
-
-    footprint = (length * width) / 1_000_000
-    vol_proxy = (length * width * height) / 1_000_000_000
-    batt_per_fp = batt / footprint if footprint > 0 else 0.0
-    torque_per_b = (float(d["torque_nm"]) / batt) if d["torque_nm"] and batt > 0 else 0.0
-    batt_per_vol = (batt / vol_proxy) if vol_proxy > 0 else 0.0
-
-    row = {
-        "top_speed_kmh":            d["top_speed_kmh"],
-        "battery_capacity_kWh":     d["battery_capacity_kWh"],
-        "number_of_cells":          d["number_of_cells"],
-        "torque_nm":                d["torque_nm"],
-        "acceleration_0_100_s":     d["acceleration_0_100_s"],
-        "fast_charging_power_kw_dc": d["fast_charging_power_kw_dc"],
-        "towing_capacity_kg":       d["towing_capacity_kg"],
-        "cargo_volume_l":           d["cargo_volume_l"],
-        "seats":                    d["seats"],
-        "length_mm":                d["length_mm"],
-        "width_mm":                 d["width_mm"],
-        "height_mm":                d["height_mm"],
-        "footprint_m2":             footprint,
-        "volume_proxy_m3":          vol_proxy,
-        "battery_per_footprint":    batt_per_fp,
-        "torque_per_battery":       torque_per_b,
-        "battery_per_volume":       batt_per_vol,
-        "fast_charge_port":         d["fast_charge_port"],
-        "drivetrain":               d["drivetrain"],
-        "segment":                  d["segment"],
-        "car_body_type":            d["car_body_type"],
-    }
-    return pd.DataFrame([row])[ALL_FEATURES]
+    
+    # Add a default brand since it's required by the model but missing in the UI
+    if "brand" not in d:
+        d["brand"] = "Unknown"
+        
+    df = pd.DataFrame([d])
+    
+    from src.features import engineer_features
+    df = engineer_features(df)
+    
+    return df[ALL_FEATURES]
 
 
 @asynccontextmanager
@@ -145,6 +123,11 @@ app.add_middleware(
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
+
+@app.get("/", tags=["System"])
+def root():
+    """Root endpoint."""
+    return {"message": "TechTrack EV Range Prediction API is running. Visit /docs for the API documentation."}
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
 def health():
